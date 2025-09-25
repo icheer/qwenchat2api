@@ -23,10 +23,7 @@
 
 2.  **设置环境变量**：
     在您的 Deno Deploy 项目的 "Settings" > "Environment Variables" 部分，添加以下变量：
-
-    *   `OPENAI_API_KEY`：（推荐）客户端访问此代理的密钥。（例如：`sk-my-secret-key-12345`）
-    *   `API_KEY`：您的 Qwen 账户令牌。可以提供多个令牌，用逗号分隔进行轮换。（例如：`ey...abc,ey...def`）
-    *   `SSXMOD_ITNA`：上游 API 所需的特殊 cookie 值。
+    *   `OPENAI_API_KEY`：（必需）客户端访问此代理的密钥。（例如：`sk-my-secret-key-12345`）
 
 3.  **运行**：
     脚本将自动部署和运行。Deno Deploy 会提供您的端点 URL。
@@ -38,8 +35,6 @@
 2.  **在终端中设置环境变量**：
     ```sh
     export OPENAI_API_KEY="your_secret_proxy_key"
-    export API_KEY="your_qwen_token"
-    export SSXMOD_ITNA="your_cookie_value"
     ```
 
 3.  **运行脚本**：
@@ -55,8 +50,6 @@
 | 变量名             | 描述                                                         | 必需     | 示例                                   |
 | ----------------- | ----------------------------------------------------------- | -------- | -------------------------------------- |
 | `OPENAI_API_KEY`  | 保护代理端点的密钥 Bearer 令牌。如果未设置，代理将对公众开放。        | 否       | `sk-my-secret-key-12345`              |
-| `API_KEY`         | 您的 Qwen 账户令牌用于上游 API。多个密钥用逗号分隔以实现轮换。        | 是       | `ey...abc,ey...def`                   |
-| `SSXMOD_ITNA`     | `chat.qwen.ai` 所需的 `ssxmod_itna` cookie 值。               | 是       | `mqUxRDBD...DYAEDBYD74G+DDeDixGm...` |
 
 ## 🔌 API 端点
 
@@ -74,7 +67,7 @@ curl -X POST http://your-deno-deploy-url/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-openai-api-key" \
   -d '{
-    "model": "qwen-max",
+    "model": "qwen3-max",
     "messages": [
       {
         "role": "user",
@@ -92,7 +85,7 @@ curl -X POST http://your-deno-deploy-url/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-openai-api-key" \
   -d '{
-    "model": "qwen-vl-max",
+    "model": "qwen3-vl-max",
     "messages": [
       {
         "role": "user",
@@ -135,11 +128,11 @@ curl -X POST http://your-deno-deploy-url/v1/chat/completions \
 
 该代理支持以下模型变体：
 
-*   `qwen-max` - 标准模型
-*   `qwen-max-thinking` - 启用思考模式
-*   `qwen-max-search` - 启用搜索功能
-*   `qwen-vl-max-image` - 图像生成模式
-*   `qwen-vl-max-video` - 视频生成模式
+*   `qwen3-max` - 标准模型
+*   `qwen3-max-thinking` - 启用思考模式
+*   `qwen3-max-search` - 启用搜索功能
+*   `qwen3-vl-max-image` - 图像生成模式
+*   `qwen3-vl-max-video` - 视频生成模式
 
 ## 🛠️ 技术实现
 

@@ -16,18 +16,8 @@
  * 2. **设置环境变量**：
  *    在您的 Deno Deploy 项目设置中，添加以下环境变量：
  *
- *    - `OPENAI_API_KEY`: （推荐）客户端访问此代理的密钥。
- *                        如果未设置，代理将对公众开放。
+ *    - `OPENAI_API_KEY`: 客户端访问此代理的密钥。自签发,自行私下约定的密钥.并非上行密钥!
  *                        示例：`sk-my-secret-key-12345`
- *
- *    - `API_KEY`: 您的 Qwen 账户令牌，用于上游 API。可以提供多个令牌，
- *                 用逗号分隔。脚本会在它们之间轮换。
- *                 这是**必需**的变量。
- *                 示例：`ey...abc,ey...def`
- *
- *    - `SSXMOD_ITNA`: 上游 API 所需的特殊 cookie 值。
- *                     某些模型或功能可能需要此值。
- *                     示例：`mqUxRDBD...DYAEDBYD74G+DDeDixGm...`
  *
  * 3. **运行**：
  *    脚本将在部署后自动运行。
@@ -37,10 +27,8 @@
  * 1. 将此文件保存为 `main.ts`。
  * 2. 在终端中设置环境变量：
  *    export OPENAI_API_KEY="your_secret_proxy_key"
- *    export API_KEY="your_qwen_token"
- *    export SSXMOD_ITNA="your_cookie_value"
  * 3. 运行脚本：
- *    deno run --allow-net --allow-env main.ts
+ *    deno run --allow-net --allow-env --unstable-kv main.ts
  *
  * --- 关于 DENO ---
  * Deno 是现代化且安全的 JavaScript 和 TypeScript 运行时。
@@ -229,46 +217,199 @@ async function uploadFileToQwenOss(
 
 // --- 1. 从环境变量读取配置 ---
 
-// 应用程序配置对象，包含所有必要的环境变量
+// 应用程序配置对象，现在简化为只需要一个可选的环境变量
 const config = {
   // OpenAI API 密钥，用于保护代理端点（可选）
-  openaiApiKey: Deno.env.get('OPENAI_API_KEY') || '',
-  // Qwen API 密钥数组，支持多个密钥轮换使用（必需）
-  apiKeys: (Deno.env.get('API_KEY') || '')
-    .split(',')
-    .map(k => k.trim())
-    .filter(Boolean),
-  // Qwen 特殊 cookie 值，某些功能可能需要（可选）
-  ssxmodItna: Deno.env.get('SSXMOD_ITNA') || ''
+  openaiApiKey: Deno.env.get('OPENAI_API_KEY') || ''
 };
-
-// 检查必需的 API_KEY 环境变量是否设置
-if (config.apiKeys.length === 0) {
-  console.error(
-    '致命错误：API_KEY 环境变量未设置或为空。这是访问上游 Qwen API 所必需的。'
-  );
-  Deno.exit(1);
-}
-
-// 如果未设置 OPENAI_API_KEY，发出警告（代理将对公众开放）
-if (!config.openaiApiKey) {
-  console.warn('警告：OPENAI_API_KEY 未设置。代理将对公众开放。');
-}
 
 // --- 内存存储管理器 ---
 
-// 全局内存存储对象
-const cookieStore = {
-    apiKeys: [],        // API_KEY (token字段) 数组
-    ssxmodItnaTokens: [] // SSXMOD_ITNA 数组
-};
+/**
+ * 令牌存储项数据结构
+ */
+interface TokenItem {
+  id: string; // 唯一标识符
+  value: string; // 令牌值（API_KEY 或 SSXMOD_ITNA）
+  isValid: boolean; // 是否有效（false表示401/403等错误）
+  createdAt: number; // 创建时间戳
+  lastUsed?: number; // 最后使用时间戳
+  errorCount: number; // 错误计数
+}
+
+/**
+ * Cookie 存储结构
+ */
+interface CookieStore {
+  apiKeys: TokenItem[]; // API_KEY (token字段) 数组
+  ssxmodItnaTokens: TokenItem[]; // SSXMOD_ITNA 数组
+}
+
+/**
+ * KV存储管理类 - 使用Deno.Kv进行持久化存储
+ */
+class KvStore {
+  private kv: Deno.Kv | null = null;
+  private readonly API_KEYS_KEY = ['tokens', 'apiKeys'];
+  private readonly SSXMOD_KEYS_KEY = ['tokens', 'ssxmodTokens'];
+
+  /**
+   * 初始化KV存储连接
+   */
+  async init(): Promise<void> {
+    try {
+      this.kv = await Deno.openKv();
+      console.log('✅ KV存储初始化成功');
+    } catch (error) {
+      console.error('❌ KV存储初始化失败:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * 获取所有API密钥
+   */
+  async getApiKeys(): Promise<TokenItem[]> {
+    if (!this.kv) throw new Error('KV存储未初始化');
+    const result = await this.kv.get<TokenItem[]>(this.API_KEYS_KEY);
+    return result.value || [];
+  }
+
+  /**
+   * 获取所有SSXMOD令牌
+   */
+  async getSsxmodTokens(): Promise<TokenItem[]> {
+    if (!this.kv) throw new Error('KV存储未初始化');
+    const result = await this.kv.get<TokenItem[]>(this.SSXMOD_KEYS_KEY);
+    return result.value || [];
+  }
+
+  /**
+   * 获取完整的存储数据
+   */
+  async getCookieStore(): Promise<CookieStore> {
+    const [apiKeys, ssxmodItnaTokens] = await Promise.all([
+      this.getApiKeys(),
+      this.getSsxmodTokens()
+    ]);
+    return { apiKeys, ssxmodItnaTokens };
+  }
+
+  /**
+   * 添加API密钥
+   */
+  async addApiKey(token: TokenItem): Promise<boolean> {
+    if (!this.kv) throw new Error('KV存储未初始化');
+    
+    const apiKeys = await this.getApiKeys();
+    
+    // 检查是否已存在
+    if (apiKeys.some(item => item.value === token.value)) {
+      return false; // 已存在
+    }
+
+    apiKeys.push(token);
+    await this.kv.set(this.API_KEYS_KEY, apiKeys);
+    return true;
+  }
+
+  /**
+   * 添加SSXMOD令牌
+   */
+  async addSsxmodToken(token: TokenItem): Promise<boolean> {
+    if (!this.kv) throw new Error('KV存储未初始化');
+    
+    const ssxmodTokens = await this.getSsxmodTokens();
+    
+    // 检查是否已存在
+    if (ssxmodTokens.some(item => item.value === token.value)) {
+      return false; // 已存在
+    }
+
+    ssxmodTokens.push(token);
+    await this.kv.set(this.SSXMOD_KEYS_KEY, ssxmodTokens);
+    return true;
+  }
+
+  /**
+   * 更新API密钥状态
+   */
+  async updateApiKey(tokenValue: string, updates: Partial<TokenItem>): Promise<boolean> {
+    if (!this.kv) throw new Error('KV存储未初始化');
+    
+    const apiKeys = await this.getApiKeys();
+    const tokenIndex = apiKeys.findIndex(item => item.value === tokenValue);
+    
+    if (tokenIndex !== -1) {
+      apiKeys[tokenIndex] = { ...apiKeys[tokenIndex], ...updates };
+      await this.kv.set(this.API_KEYS_KEY, apiKeys);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 更新SSXMOD令牌状态
+   */
+  async updateSsxmodToken(tokenValue: string, updates: Partial<TokenItem>): Promise<boolean> {
+    if (!this.kv) throw new Error('KV存储未初始化');
+    
+    const ssxmodTokens = await this.getSsxmodTokens();
+    const tokenIndex = ssxmodTokens.findIndex(item => item.value === tokenValue);
+    
+    if (tokenIndex !== -1) {
+      ssxmodTokens[tokenIndex] = { ...ssxmodTokens[tokenIndex], ...updates };
+      await this.kv.set(this.SSXMOD_KEYS_KEY, ssxmodTokens);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 删除无效的令牌
+   */
+  async deleteInvalidTokens(): Promise<{ deletedApiKeys: number; deletedSsxmods: number }> {
+    if (!this.kv) throw new Error('KV存储未初始化');
+    
+    const [apiKeys, ssxmodTokens] = await Promise.all([
+      this.getApiKeys(),
+      this.getSsxmodTokens()
+    ]);
+
+    const validApiKeys = apiKeys.filter(item => item.isValid);
+    const validSsxmodTokens = ssxmodTokens.filter(item => item.isValid);
+
+    const deletedApiKeys = apiKeys.length - validApiKeys.length;
+    const deletedSsxmods = ssxmodTokens.length - validSsxmodTokens.length;
+
+    await Promise.all([
+      this.kv.set(this.API_KEYS_KEY, validApiKeys),
+      this.kv.set(this.SSXMOD_KEYS_KEY, validSsxmodTokens)
+    ]);
+
+    return { deletedApiKeys, deletedSsxmods };
+  }
+
+  /**
+   * 关闭KV连接
+   */
+  close(): void {
+    if (this.kv) {
+      this.kv.close();
+      this.kv = null;
+    }
+  }
+}
+
+// 创建KV存储实例
+const kvStore = new KvStore();
 
 /**
  * 生成唯一标识符
  * @returns 唯一ID字符串
  */
 function generateId(): string {
-    return crypto.randomUUID();
+  return crypto.randomUUID();
 }
 
 /**
@@ -277,105 +418,102 @@ function generateId(): string {
  * @returns 掩码后的显示字符串
  */
 function maskTokenValue(value: string): string {
-    if (value.length <= 8) {
-        return value; // 太短的值不掩码
-    }
-    const start = value.substring(0, 4);
-    const end = value.substring(value.length - 4);
-    const maskLength = Math.min(value.length - 8, 20); // 限制掩码长度
-    const mask = '*'.repeat(maskLength);
-    return `${start}${mask}${end}`;
+  if (value.length <= 8) {
+    return value; // 太短的值不掩码
+  }
+  const start = value.substring(0, 4);
+  const end = value.substring(value.length - 4);
+  const maskLength = Math.min(value.length - 8, 20); // 限制掩码长度
+  const mask = '*'.repeat(maskLength);
+  return `${start}${mask}${end}`;
 }
 
 /**
  * 添加 API_KEY 到存储中（自动去重）
  * @param value API_KEY 值
  */
-function addApiKey(value: string): void {
-    // 检查是否已存在
-    const exists = cookieStore.apiKeys.find(item => item.value === value);
-    if (exists) {
-        console.log('API_KEY 已存在，跳过添加');
-        return;
-    }
+async function addApiKey(value: string): Promise<void> {
+  // 添加新的 API_KEY
+  const newToken: TokenItem = {
+    id: generateId(),
+    value: value,
+    isValid: true, // 新导入默认为 true
+    createdAt: Date.now(),
+    lastUsed: undefined,
+    errorCount: 0
+  };
 
-    // 添加新的 API_KEY
-    const newToken = {
-        id: generateId(),
-        value: value,
-        isValid: true, // 新导入默认为 true
-        createdAt: Date.now(),
-        lastUsed: undefined,
-        errorCount: 0
-    };
-    
-    cookieStore.apiKeys.push(newToken);
+  const added = await kvStore.addApiKey(newToken);
+  if (added) {
     console.log(`已添加新的 API_KEY: ${maskTokenValue(value)}`);
+  } else {
+    console.log('API_KEY 已存在，跳过添加');
+  }
 }
 
 /**
  * 添加 SSXMOD_ITNA 到存储中（自动去重）
  * @param value SSXMOD_ITNA 值
  */
-function addSsxmodItna(value: string): void {
-    // 检查是否已存在
-    const exists = cookieStore.ssxmodItnaTokens.find(item => item.value === value);
-    if (exists) {
-        console.log('SSXMOD_ITNA 已存在，跳过添加');
-        return;
-    }
+async function addSsxmodItna(value: string): Promise<void> {
+  // 添加新的 SSXMOD_ITNA
+  const newToken: TokenItem = {
+    id: generateId(),
+    value: value,
+    isValid: true, // 新导入默认为 true
+    createdAt: Date.now(),
+    lastUsed: undefined,
+    errorCount: 0
+  };
 
-    // 添加新的 SSXMOD_ITNA
-    const newToken = {
-        id: generateId(),
-        value: value,
-        isValid: true, // 新导入默认为 true
-        createdAt: Date.now(),
-        lastUsed: undefined,
-        errorCount: 0
-    };
-    
-    cookieStore.ssxmodItnaTokens.push(newToken);
+  const added = await kvStore.addSsxmodToken(newToken);
+  if (added) {
     console.log(`已添加新的 SSXMOD_ITNA: ${maskTokenValue(value)}`);
+  } else {
+    console.log('SSXMOD_ITNA 已存在，跳过添加');
+  }
 }
 
 /**
- * 轮换获取可用的 API_KEY（跳过 isValid=false 的项目）
+ * 轮换获取可用的 API_KEY（优先使用环境变量，然后是 KvStore）
  * @returns 可用的 API_KEY 值或 null
  */
-function getValidApiKey(): string | null {
-    const validTokens = cookieStore.apiKeys.filter(token => token.isValid);
-    
-    if (validTokens.length === 0) {
-        return null;
-    }
+async function getValidApiKey(): Promise<string | null> {
+  const validTokens = (await kvStore.getApiKeys()).filter(token => token.isValid);
+  console.log(`当前 API_KEY 存储状态: 共${validTokens.length}个有效令牌`);
 
-    // 简单轮换：按最少使用优先
-    validTokens.sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0));
-    const selectedToken = validTokens[0];
-    
-    // 更新使用时间
-    selectedToken.lastUsed = Date.now();
-    
-    return selectedToken.value;
+  if (validTokens.length === 0) {
+    return null;
+  }
+
+  // 简单轮换：按最少使用优先
+  validTokens.sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0));
+  const selectedToken = validTokens[0];
+
+  // 更新使用时间
+  await kvStore.updateApiKey(selectedToken.value, { lastUsed: Date.now() });
+
+  return selectedToken.value;
 }
 
 /**
  * 获取可用的 SSXMOD_ITNA 值
  * @returns 可用的 SSXMOD_ITNA 值或 null
  */
-function getValidSsxmodItna(): string | null {
-    const validTokens = cookieStore.ssxmodItnaTokens.filter(token => token.isValid);
-    
-    if (validTokens.length === 0) {
-        return null;
-    }
+async function getValidSsxmodItna(): Promise<string | null> {
+  const validTokens = (await kvStore.getSsxmodTokens()).filter(
+    token => token.isValid
+  );
 
-    // 简单选择第一个可用的
-    const selectedToken = validTokens[0];
-    selectedToken.lastUsed = Date.now();
-    
-    return selectedToken.value;
+  if (validTokens.length === 0) {
+    return null;
+  }
+
+  // 简单选择第一个可用的
+  const selectedToken = validTokens[0];
+  await kvStore.updateSsxmodToken(selectedToken.value, { lastUsed: Date.now() });
+
+  return selectedToken.value;
 }
 
 /**
@@ -383,23 +521,39 @@ function getValidSsxmodItna(): string | null {
  * @param type 令牌类型：'apiKey' 或 'ssxmod'
  * @param value 令牌值
  */
-function markAsInvalid(type: string, value: string): void {
-    let tokenArray;
-    if (type === 'apiKey') {
-        tokenArray = cookieStore.apiKeys;
-    } else if (type === 'ssxmod') {
-        tokenArray = cookieStore.ssxmodItnaTokens;
-    } else {
-        console.error(`无效的令牌类型: ${type}`);
-        return;
-    }
+async function markAsInvalid(type: string, value: string): Promise<void> {
+  if (type === 'apiKey') {
+    await kvStore.updateApiKey(value, { 
+      isValid: false, 
+      errorCount: await getTokenErrorCount(value, 'apiKey') + 1 
+    });
+  } else if (type === 'ssxmod') {
+    await kvStore.updateSsxmodToken(value, { 
+      isValid: false, 
+      errorCount: await getTokenErrorCount(value, 'ssxmod') + 1 
+    });
+  } else {
+    console.error(`无效的令牌类型: ${type}`);
+    return;
+  }
+  
+  console.log(`已标记 ${type} 为无效: ${maskTokenValue(value)}`);
+}
 
-    const token = tokenArray.find(item => item.value === value);
-    if (token) {
-        token.isValid = false;
-        token.errorCount = (token.errorCount || 0) + 1;
-        console.log(`已标记 ${type} 为无效: ${maskTokenValue(value)}`);
-    }
+/**
+ * 获取令牌的错误计数
+ */
+async function getTokenErrorCount(value: string, type: string): Promise<number> {
+  if (type === 'apiKey') {
+    const tokens = await kvStore.getApiKeys();
+    const token = tokens.find(item => item.value === value);
+    return token ? token.errorCount : 0;
+  } else if (type === 'ssxmod') {
+    const tokens = await kvStore.getSsxmodTokens();
+    const token = tokens.find(item => item.value === value);
+    return token ? token.errorCount : 0;
+  }
+  return 0;
 }
 
 /**
@@ -408,72 +562,206 @@ function markAsInvalid(type: string, value: string): void {
  * @param maskedValue 掩码后的令牌值
  * @returns 是否成功删除
  */
-function deleteInvalidToken(type: string, maskedValue: string): boolean {
-    let tokenArray;
-    if (type === 'apiKey') {
-        tokenArray = cookieStore.apiKeys;
-    } else if (type === 'ssxmod') {
-        tokenArray = cookieStore.ssxmodItnaTokens;
-    } else {
-        return false;
-    }
+async function deleteInvalidToken(type: string, maskedValue: string): Promise<boolean> {
+  // 暂时使用KV存储的批量删除功能
+  const result = await kvStore.deleteInvalidTokens();
+  console.log(`已删除 ${result.deletedApiKeys} 个无效API密钥，${result.deletedSsxmods} 个无效SSXMOD令牌`);
+  return result.deletedApiKeys > 0 || result.deletedSsxmods > 0;
+}
 
-    // 通过掩码值查找对应的无效令牌
-    const tokenIndex = tokenArray.findIndex(item => 
-        !item.isValid && maskTokenValue(item.value) === maskedValue
-    );
+/**
+ * 显示令牌项数据结构
+ */
+interface DisplayTokenItem {
+  id: string;
+  maskedValue: string;
+  isValid: boolean;
+  createdAt: string;
+  lastUsed: string;
+  errorCount: number;
+}
 
-    if (tokenIndex === -1) {
-        return false; // 未找到匹配的无效令牌
-    }
-
-    // 删除令牌
-    const deletedToken = tokenArray.splice(tokenIndex, 1)[0];
-    console.log(`已删除失效的 ${type}: ${maskTokenValue(deletedToken.value)}`);
-    return true;
+/**
+ * 显示列表数据结构
+ */
+interface DisplayList {
+  apiKeys: DisplayTokenItem[];
+  ssxmod: DisplayTokenItem[];
 }
 
 /**
  * 获取用于显示的令牌列表（掩码处理）
  * @returns 包含掩码后令牌信息的显示列表
  */
-function getDisplayList(): any {
-    const apiKeysList = cookieStore.apiKeys.map(token => ({
-        id: token.id,
-        maskedValue: maskTokenValue(token.value),
-        isValid: token.isValid,
-        createdAt: new Date(token.createdAt).toLocaleString('zh-CN'),
-        lastUsed: token.lastUsed ? new Date(token.lastUsed).toLocaleString('zh-CN') : '未使用',
-        errorCount: token.errorCount || 0
-    }));
+async function getDisplayList(): Promise<DisplayList> {
+  const cookieStoreData = await kvStore.getCookieStore();
+  
+  const apiKeysList = cookieStoreData.apiKeys.map(token => ({
+    id: token.id,
+    maskedValue: maskTokenValue(token.value),
+    isValid: token.isValid,
+    createdAt: new Date(token.createdAt).toLocaleString('zh-CN'),
+    lastUsed: token.lastUsed
+      ? new Date(token.lastUsed).toLocaleString('zh-CN')
+      : '未使用',
+    errorCount: token.errorCount || 0
+  }));
 
-    const ssxmodList = cookieStore.ssxmodItnaTokens.map(token => ({
-        id: token.id,
-        maskedValue: maskTokenValue(token.value),
-        isValid: token.isValid,
-        createdAt: new Date(token.createdAt).toLocaleString('zh-CN'),
-        lastUsed: token.lastUsed ? new Date(token.lastUsed).toLocaleString('zh-CN') : '未使用',
-        errorCount: token.errorCount || 0
-    }));
+  const ssxmodList = cookieStoreData.ssxmodItnaTokens.map(token => ({
+    id: token.id,
+    maskedValue: maskTokenValue(token.value),
+    isValid: token.isValid,
+    createdAt: new Date(token.createdAt).toLocaleString('zh-CN'),
+    lastUsed: token.lastUsed
+      ? new Date(token.lastUsed).toLocaleString('zh-CN')
+      : '未使用',
+    errorCount: token.errorCount || 0
+  }));
 
-    return {
-        apiKeys: apiKeysList,
-        ssxmod: ssxmodList
-    };
+  return {
+    apiKeys: apiKeysList,
+    ssxmod: ssxmodList
+  };
+}
+
+// --- 初始化内存存储 ---
+
+// 注意：环境变量中的 OPENAI_API_KEY 仅用于服务器端身份验证，
+// 不会加入到 cookieStore 中，以确保安全性
+
+// 显示初始化信息
+if (!config.openaiApiKey) {
+  console.warn('⚠️ 未设置 OPENAI_API_KEY。');
+  console.warn(
+    '   建议：通过环境变量设置默认密钥，或使用 /cookies 接口导入密钥。'
+  );
+  console.warn('   如果没有导入任何密钥，服务将无法正常工作。');
+}
+
+// --- Cookie 解析功能 ---
+
+/**
+ * 解析 Cookie 字符串，提取 token（API_KEY）和 ssxmod_itna 字段
+ * @param cookieString 完整的 Cookie 字符串
+ * @returns 解析结果对象 { token?: string, ssxmodItna?: string }
+ */
+function parseCookieString(cookieString: string): {
+  token?: string;
+  ssxmodItna?: string;
+} {
+  const result: { token?: string; ssxmodItna?: string } = {};
+
+  try {
+    // 清理 Cookie 字符串（去掉前后空白）
+    const cleanCookie = cookieString.trim();
+
+    // 正则表达式匹配 token 字段（支持 sk- 开头或 JWT 格式）
+    const tokenMatch = cleanCookie.match(/token=([^;]+)/);
+    if (tokenMatch && tokenMatch[1]) {
+      const tokenValue = decodeURIComponent(tokenMatch[1].trim());
+      // 验证 token 格式（sk-开头 或 JWT格式 或 其他合理长度的token）
+      if (
+        (tokenValue.startsWith('sk-') && tokenValue.length > 10) ||
+        (tokenValue.includes('.') && tokenValue.length > 50) || // JWT格式
+        tokenValue.length > 20
+      ) {
+        // 其他格式的长token
+        result.token = tokenValue;
+      }
+    }
+
+    // 正则表达式匹配 ssxmod_itna 字段
+    const ssxmodMatch = cleanCookie.match(/ssxmod_itna=([^;]+)/);
+    if (ssxmodMatch && ssxmodMatch[1]) {
+      const ssxmodValue = decodeURIComponent(ssxmodMatch[1].trim());
+      // 验证 ssxmod_itna 格式（不为空）
+      if (ssxmodValue.length > 0) {
+        result.ssxmodItna = ssxmodValue;
+      }
+    }
+
+    console.log(
+      `Cookie 解析完成 - token: ${
+        result.token ? '已提取' : '未找到'
+      }, ssxmod_itna: ${result.ssxmodItna ? '已提取' : '未找到'}`
+    );
+  } catch (error) {
+    console.error('Cookie 解析失败:', error);
+  }
+
+  return result;
+}
+
+/**
+ * 批量解析 Cookie 字符串数组
+ * @param cookieStrings Cookie 字符串数组
+ * @returns 解析统计信息
+ */
+async function batchParseCookies(cookieStrings: string[]): Promise<{
+  tokensAdded: number;
+  ssxmodsAdded: number;
+  totalProcessed: number;
+}> {
+  let tokensAdded = 0;
+  let ssxmodsAdded = 0;
+  
+  // 获取处理前的数据
+  const beforeApiKeys = await kvStore.getApiKeys();
+  const beforeSsxmods = await kvStore.getSsxmodTokens();
+  const beforeApiKeyCount = beforeApiKeys.length;
+  const beforeSsxmodCount = beforeSsxmods.length;
+
+  for (const cookieString of cookieStrings) {
+    if (!cookieString || cookieString.trim().length === 0) {
+      continue; // 跳过空字符串
+    }
+
+    const parsed = parseCookieString(cookieString);
+
+    // 添加解析出的 token
+    if (parsed.token) {
+      await addApiKey(parsed.token);
+    }
+
+    // 添加解析出的 ssxmod_itna
+    if (parsed.ssxmodItna) {
+      await addSsxmodItna(parsed.ssxmodItna);
+    }
+  }
+  
+  // 获取处理后的数据并计算增量
+  const afterApiKeys = await kvStore.getApiKeys();
+  const afterSsxmods = await kvStore.getSsxmodTokens();
+  tokensAdded = afterApiKeys.length - beforeApiKeyCount;
+  ssxmodsAdded = afterSsxmods.length - beforeSsxmodCount;
+
+  const result = {
+    tokensAdded,
+    ssxmodsAdded,
+    totalProcessed: cookieStrings.length
+  };
+
+  console.log(
+    `批量解析完成: 处理了 ${result.totalProcessed} 个 Cookie，新增 ${result.tokensAdded} 个 token，新增 ${result.ssxmodsAdded} 个 ssxmod_itna`
+  );
+
+  return result;
 }
 
 // 简单的令牌轮换器，用于上游 API 密钥轮换
 let tokenIndex = 0;
 /**
  * 获取下一个可用的上游 API 令牌
- * 实现轮换逻辑以分散请求负载
- * @returns 当前轮换到的 API 令牌
+ * 现在使用KV存储管理的动态密钥轮换
+ * @returns 当前轮换到的 API 令牌，如果没有可用密钥则返回空字符串
  */
-function getUpstreamToken(): string {
-  if (config.apiKeys.length === 0) return '';
-  const token = config.apiKeys[tokenIndex];
-  tokenIndex = (tokenIndex + 1) % config.apiKeys.length;
-  return token;
+async function getUpstreamToken(): Promise<string> {
+  const apiKey = await getValidApiKey();
+  if (!apiKey) {
+    console.warn('警告：没有可用的 API 密钥！请通过 /cookies 接口导入密钥。');
+    return '';
+  }
+  return apiKey;
 }
 
 // --- 2. 核心转换逻辑（基于原始 Node.js 项目分析） ---
@@ -614,7 +902,7 @@ async function processMessagesForQwen(
  * @returns 转换后的 Qwen API 请求体
  */
 function transformOpenAIRequestToQwen(openAIRequest: any): any {
-  const model = openAIRequest.model || 'qwen-max';
+  const model = openAIRequest.model || 'qwen3-max';
 
   // 根据模型后缀确定聊天类型
   let chat_type = 't2t'; // 默认：文本到文本
@@ -749,7 +1037,7 @@ function createQwenToOpenAIStreamTransformer(): TransformStream<
  */
 async function handleGetModels() {
   // 获取轮换的上游令牌
-  const token = getUpstreamToken();
+  const token = await getUpstreamToken();
   if (!token) {
     return {
       status: 503,
@@ -820,7 +1108,7 @@ async function handleGetModels() {
  */
 async function handleChatCompletions(requestBody: any) {
   // 获取轮换的上游令牌
-  const token = getUpstreamToken();
+  const token = await getUpstreamToken();
   if (!token) {
     return {
       status: 503,
@@ -846,10 +1134,16 @@ async function handleChatCompletions(requestBody: any) {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' // 模拟浏览器
     };
 
-    // 如果配置了特殊 cookie，添加到请求头中
-    if (config.ssxmodItna) {
-      headers['Cookie'] = `ssxmod_itna=${config.ssxmodItna}`;
+    // 如果有可用的 SSXMOD_ITNA，添加到请求头中
+    const ssxmodItna = await getValidSsxmodItna();
+    if (ssxmodItna) {
+      headers['Cookie'] = `ssxmod_itna=${ssxmodItna}`;
     }
+
+    // 打印信息用于离线调试
+    console.log('url', 'https://chat.qwen.ai/api/chat/completions');
+    console.log('headers', JSON.stringify(headers, null, 2));
+    console.log('body', JSON.stringify(qwenRequest, null, 2));
 
     // 向上游 Qwen API 发送请求
     const upstreamResponse = await fetch(
@@ -865,6 +1159,24 @@ async function handleChatCompletions(requestBody: any) {
     if (!upstreamResponse.ok || !upstreamResponse.body) {
       const errorBody = await upstreamResponse.text();
       console.error(`上游 API 错误：${upstreamResponse.status}`, errorBody);
+
+      // 4xx 错误处理：标记相关令牌为失效状态
+      if (upstreamResponse.status >= 400 && upstreamResponse.status < 500) {
+        console.warn(
+          `检测到 4xx 错误 (${upstreamResponse.status})，开始标记相关令牌为失效状态`
+        );
+
+        // 标记 API_KEY 为失效
+        await markAsInvalid('apiKey', token);
+
+        // 如果使用了 ssxmod_itna，也标记为失效
+        if (ssxmodItna) {
+          await markAsInvalid('ssxmod', ssxmodItna);
+        }
+
+        console.warn('令牌已标记为失效，后续请求将自动轮换至其他可用令牌');
+      }
+
       return {
         status: upstreamResponse.status,
         body: { error: '上游 API 请求失败', details: errorBody }
@@ -919,12 +1231,60 @@ app.use(async (ctx: any, next: any) => {
 
 // 身份验证中间件
 const authMiddleware: Middleware = async (ctx: any, next: any) => {
-  // 跳过根路径的身份验证（信息页面）
-  if (ctx.request.url.pathname === '/') {
+  const pathname = ctx.request.url.pathname;
+  const method = ctx.request.method;
+  
+  // 跳过根路径的身份验证
+  if (pathname === '/') {
+    await next();
+    return;
+  }
+  
+  // Cookie管理路径的特殊处理
+  if (pathname.startsWith('/cookies')) {
+    // GET请求（查看状态）无需身份验证
+    if (method === 'GET') {
+      await next();
+      return;
+    }
+    
+    // DELETE /cookies/invalid（清理无效令牌）无需身份验证
+    if (method === 'DELETE' && pathname === '/cookies/invalid') {
+      await next();
+      return;
+    }
+    
+    // POST请求（导入）和其他DELETE请求需要身份验证
+    if (method === 'POST' || method === 'DELETE') {
+      // 如果服务器未配置密钥，禁止这些操作
+      if (!config.openaiApiKey) {
+        ctx.response.status = 503;
+        ctx.response.body = { 
+          success: false,
+          error: '服务器未配置身份验证密钥，Cookie 导入功能不可用。' 
+        };
+        return;
+      }
+
+      // 验证客户端提供的 Authorization 头
+      const authHeader = ctx.request.headers.get('Authorization');
+      const clientToken = authHeader?.replace(/^Bearer\s+/, '');
+
+      if (clientToken !== config.openaiApiKey) {
+        ctx.response.status = 401;
+        ctx.response.body = { 
+          success: false,
+          error: '身份验证失败。请检查 OPENAI_API_KEY 是否正确。' 
+        };
+        return;
+      }
+    }
+    
     await next();
     return;
   }
 
+  // 其他API路径的身份验证
   // 如果服务器未配置密钥，允许请求但记录警告
   if (!config.openaiApiKey) {
     await next();
@@ -945,46 +1305,489 @@ const authMiddleware: Middleware = async (ctx: any, next: any) => {
 
 /**
  * GET / (根路径)
- * 提供简单的信息页面，显示代理服务器的基本信息和可用端点
+ * 提供 Cookie 管理界面，用于导入和管理令牌
  */
 router.get('/', (ctx: Context) => {
-  const htmlContent = `
-        <!DOCTYPE html>
-        <html lang="zh-CN">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Qwen API 代理</title>
-            <style>
-                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 40px; background-color: #121212; color: #E0E0E0; }
-                h1, h2 { color: #BB86FC; border-bottom: 2px solid #373737; padding-bottom: 10px; }
-                code { background-color: #333; padding: 2px 6px; border-radius: 4px; font-family: "Courier New", Courier, monospace; }
-                p { line-height: 1.6; }
-                a { color: #03DAC6; text-decoration: none; }
-                a:hover { text-decoration: underline; }
-                .container { max-width: 800px; margin: 0 auto; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>🚀 Qwen API 代理</h1>
-                <p>此服务器作为代理，将标准的 OpenAI API 请求转换为 Qwen Chat API 的专有格式。</p>
-                
-                <h2>可用的 API 端点</h2>
-                <ul>
-                    <li><code>GET /v1/models</code> - 检索可用模型列表。</li>
-                    <li><code>POST /v1/chat/completions</code> - 主要聊天端点，支持流式传输。</li>
-                </ul>
-
-                <h2>源代码</h2>
-                <p>本项目的原始源代码可在以下地址找到：</p>
-                <p><a href="https://github.com/highkay/qwenchat2api" target="_blank">https://github.com/highkay/qwenchat2api</a></p>
-            </div>
-        </body>
-        </html>
-    `;
-  ctx.response.body = htmlContent;
   ctx.response.headers.set('Content-Type', 'text/html; charset=utf-8');
+  ctx.response.body = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qwen2OpenAI 代理 - Cookie 管理</title>
+    <script src="https://unpkg.com/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .status-item {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            text-align: center;
+            border-left: 4px solid #667eea;
+        }
+        .status-number {
+            font-size: 24px;
+            font-weight: bold;
+            color: #667eea;
+        }
+        .import-section {
+            border-top: 2px dashed #eee;
+            padding-top: 20px;
+        }
+        textarea {
+            width: 100%;
+            height: 120px;
+            padding: 12px;
+            border: 2px solid #e1e5e9;
+            border-radius: 6px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            resize: vertical;
+            box-sizing: border-box;
+        }
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .auth-section {
+            margin: 15px 0;
+            padding: 15px;
+            background: #f8f9ff;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+        }
+        .auth-section label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #2d3748;
+        }
+        .auth-section input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #cbd5e0;
+            border-radius: 4px;
+            font-size: 14px;
+            margin-bottom: 8px;
+            box-sizing: border-box;
+        }
+        .auth-section input:focus {
+            border-color: #667eea;
+            outline: none;
+        }
+        .auth-help {
+            font-size: 12px;
+            color: #718096;
+            font-style: italic;
+        }
+        
+        .button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 5px;
+            transition: background-color 0.2s;
+        }
+        .button:hover {
+            background: #5a67d8;
+        }
+        .button:disabled {
+            background: #a0aec0;
+            cursor: not-allowed;
+        }
+        .button.danger {
+            background: #e53e3e;
+        }
+        .button.danger:hover {
+            background: #c53030;
+        }
+        .tokens-table {
+            overflow-x: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            text-align: left;
+            padding: 12px;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        th {
+            background: #f7fafc;
+            font-weight: 600;
+        }
+        .token-valid {
+            color: #38a169;
+            font-weight: bold;
+        }
+        .token-invalid {
+            color: #e53e3e;
+            font-weight: bold;
+        }
+        .loading {
+            display: inline-block;
+            margin-left: 10px;
+        }
+        .help-text {
+            color: #718096;
+            font-size: 13px;
+            margin-top: 8px;
+        }
+        .example-cookie {
+            background: #f7fafc;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            margin: 10px 0;
+            word-break: break-all;
+        }
+        .tabs {
+            display: flex;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        .tab-button {
+            background: none;
+            border: none;
+            padding: 12px 20px;
+            cursor: pointer;
+            font-size: 14px;
+            color: #718096;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab-button.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+        }
+        .tab-button:hover {
+            color: #5a67d8;
+            background: #f7fafc;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .input-group {
+            margin-bottom: 15px;
+        }
+        .input-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #2d3748;
+        }
+        .input-group input {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #e1e5e9;
+            border-radius: 6px;
+            font-size: 14px;
+            box-sizing: border-box;
+            margin-bottom: 10px;
+        }
+        .input-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🤖 Qwen2OpenAI 代理服务</h1>
+        <p>Cookie 令牌管理界面</p>
+    </div>
+
+    <div class="card">
+        <h2>📊 当前状态</h2>
+        <div class="status-grid" id="statusGrid">
+            <div class="status-item">
+                <div class="status-number" id="totalApiKeys">-</div>
+                <div>API Keys 总数</div>
+            </div>
+            <div class="status-item">
+                <div class="status-number" id="validApiKeys">-</div>
+                <div>有效 API Keys</div>
+            </div>
+            <div class="status-item">
+                <div class="status-number" id="totalSsxmod">-</div>
+                <div>SSXMOD 总数</div>
+            </div>
+            <div class="status-item">
+                <div class="status-number" id="validSsxmod">-</div>
+                <div>有效 SSXMOD</div>
+            </div>
+        </div>
+        <button class="button" onclick="refreshStatus()">🔄 刷新状态</button>
+        <button class="button danger" onclick="clearInvalidTokens()">🗑️ 清理失效令牌</button>
+    </div>
+
+    <div class="card import-section">
+        <h2>📥 导入令牌</h2>
+        
+        <!-- Cookie 导入选项卡 -->
+        <div id="cookies-tab" class="tab-content active">
+            <div class="help-text">
+                请在下方文本框中粘贴完整的 Cookie 字符串，每行一个。系统会自动提取其中的 <code>token</code> 和 <code>ssxmod_itna</code> 字段。
+            </div>
+            <div class="example-cookie">
+                示例格式：token=eyJhbGciOiJIUzI1NiIs...; ssxmod_itna=abc123...; other_field=value
+            </div>
+            <textarea id="cookiesInput" placeholder="请粘贴 Cookie 字符串，每行一个...&#10;例如：&#10;token=eyJhbGciOiJIUzI1NiIs...; ssxmod_itna=abc123...; path=/&#10;token=sk-789012...; ssxmod_itna=def456...; domain=.example.com"></textarea>
+            
+            <div class="auth-section">
+                <label for="authKey">🔑 身份验证密钥</label>
+                <input type="password" id="authKey" placeholder="请输入 OPENAI_API_KEY 进行身份验证" />
+                <div class="auth-help">
+                    此密钥用于验证您的身份，防止未授权的 Cookie 导入操作
+                </div>
+            </div>
+            
+            <div>
+                <button class="button" onclick="importCookies()">📤 导入 Cookies</button>
+                <button class="button" onclick="clearInput('cookiesInput')">🧹 清空输入</button>
+                <span id="importLoading" class="loading" style="display: none;">导入中...</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>🔍 令牌详情</h2>
+        <div class="tokens-table" id="tokensTable">
+            <p>点击"刷新状态"来加载令牌详情</p>
+        </div>
+    </div>
+
+    <script>
+        // 刷新状态
+        async function refreshStatus() {
+            try {
+                const response = await fetch('/cookies');
+                const result = await response.json();
+                
+                if (result.success) {
+                    const data = result.data;
+                    
+                    // 更新状态数字
+                    document.getElementById('totalApiKeys').textContent = data.apiKeys.total;
+                    document.getElementById('validApiKeys').textContent = data.apiKeys.valid;
+                    document.getElementById('totalSsxmod').textContent = data.ssxmodTokens.total;
+                    document.getElementById('validSsxmod').textContent = data.ssxmodTokens.valid;
+                    
+                    // 更新令牌表格
+                    updateTokensTable(data);
+                } else {
+                    Swal.fire('错误', result.message, 'error');
+                }
+            } catch (error) {
+                Swal.fire('错误', '无法获取状态: ' + error.message, 'error');
+            }
+        }
+
+        // 更新令牌表格
+        function updateTokensTable(data) {
+            const container = document.getElementById('tokensTable');
+            
+            let html = '<h3>API Keys</h3>';
+            if (data.apiKeys.items.length > 0) {
+                html += \`<table>
+                    <thead>
+                        <tr>
+                            <th>掩码值</th>
+                            <th>状态</th>
+                            <th>创建时间</th>
+                            <th>最后使用</th>
+                            <th>错误次数</th>
+                        </tr>
+                    </thead>
+                    <tbody>\`;
+                
+                data.apiKeys.items.forEach(token => {
+                    html += \`<tr>
+                        <td><code>\${token.maskedValue}</code></td>
+                        <td class="\${token.isValid ? 'token-valid' : 'token-invalid'}">\${token.isValid ? '有效' : '失效'}</td>
+                        <td>\${token.createdAt}</td>
+                        <td>\${token.lastUsed}</td>
+                        <td>\${token.errorCount}</td>
+                    </tr>\`;
+                });
+                html += '</tbody></table>';
+            } else {
+                html += '<p>暂无 API Keys</p>';
+            }
+            
+            html += '<h3>SSXMOD Tokens</h3>';
+            if (data.ssxmodTokens.items.length > 0) {
+                html += \`<table>
+                    <thead>
+                        <tr>
+                            <th>掩码值</th>
+                            <th>状态</th>
+                            <th>创建时间</th>
+                            <th>最后使用</th>
+                            <th>错误次数</th>
+                        </tr>
+                    </thead>
+                    <tbody>\`;
+                
+                data.ssxmodTokens.items.forEach(token => {
+                    html += \`<tr>
+                        <td><code>\${token.maskedValue}</code></td>
+                        <td class="\${token.isValid ? 'token-valid' : 'token-invalid'}">\${token.isValid ? '有效' : '失效'}</td>
+                        <td>\${token.createdAt}</td>
+                        <td>\${token.lastUsed}</td>
+                        <td>\${token.errorCount}</td>
+                    </tr>\`;
+                });
+                html += '</tbody></table>';
+            } else {
+                html += '<p>暂无 SSXMOD Tokens</p>';
+            }
+            
+            container.innerHTML = html;
+        }
+
+        // 导入 Cookies
+        async function importCookies() {
+            const input = document.getElementById('cookiesInput').value.trim();
+            const authKey = document.getElementById('authKey').value.trim();
+            
+            if (!input) {
+                Swal.fire('提示', '请先输入 Cookie 数据', 'warning');
+                return;
+            }
+            
+            if (!authKey) {
+                Swal.fire('提示', '请输入身份验证密钥', 'warning');
+                return;
+            }
+
+            const loading = document.getElementById('importLoading');
+            loading.style.display = 'inline';
+
+            try {
+                const cookies = input.split('\\n').filter(line => line.trim().length > 0);
+                
+                const response = await fetch('/cookies', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': \`Bearer \${authKey}\`
+                    },
+                    body: JSON.stringify({ cookies })
+                });
+
+                const result = await response.json();
+                
+                if (result.success) {
+                    Swal.fire({
+                        title: '导入成功！',
+                        html: \`
+                            <p>处理了 <strong>\${result.data.import.processed}</strong> 个 Cookie</p>
+                            <p>新增 <strong>\${result.data.import.tokensAdded}</strong> 个 API Key</p>
+                            <p>新增 <strong>\${result.data.import.ssxmodsAdded}</strong> 个 SSXMOD 令牌</p>
+                        \`,
+                        icon: 'success'
+                    });
+                    
+                    // 清空输入并刷新状态
+                    document.getElementById('cookiesInput').value = '';
+                    document.getElementById('authKey').value = '';
+                    refreshStatus();
+                } else {
+                    Swal.fire('导入失败', result.message || '身份验证失败，请检查密钥是否正确', 'error');
+                }
+            } catch (error) {
+                Swal.fire('错误', '导入过程中发生错误: ' + error.message, 'error');
+            } finally {
+                loading.style.display = 'none';
+            }
+        }
+
+        // 清理失效令牌
+        async function clearInvalidTokens() {
+            const result = await Swal.fire({
+                title: '确认删除',
+                text: '将删除所有标记为失效的令牌，此操作无法撤销',
+                icon: 'warning',
+                showCancelButton: true,
+                confirmButtonText: '确认删除',
+                cancelButtonText: '取消'
+            });
+
+            if (result.isConfirmed) {
+                try {
+                    const response = await fetch('/cookies/invalid', {
+                        method: 'DELETE'
+                    });
+
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        Swal.fire('删除成功', data.message, 'success');
+                        refreshStatus();
+                    } else {
+                        Swal.fire('删除失败', data.message, 'error');
+                    }
+                } catch (error) {
+                    Swal.fire('错误', '删除过程中发生错误: ' + error.message, 'error');
+                }
+            }
+        }
+
+        // 清空输入
+        function clearInput(elementId = 'cookiesInput') {
+            document.getElementById(elementId).value = '';
+        }
+
+        // 页面加载时自动刷新状态
+        document.addEventListener('DOMContentLoaded', function() {
+            refreshStatus();
+        });
+    </script>
+</body>
+</html>
+  `;
 });
 
 /**
@@ -1018,6 +1821,130 @@ router.post('/v1/chat/completions', async (ctx: Context) => {
   }
 });
 
+/**
+ * GET /cookies
+ * 获取当前内存中存储的令牌列表（掩码显示）
+ */
+router.get('/cookies', async (ctx: Context) => {
+  try {
+    const displayList = await getDisplayList();
+    const summary = {
+      timestamp: new Date().toLocaleString('zh-CN'),
+      apiKeys: {
+        total: displayList.apiKeys.length,
+        valid: displayList.apiKeys.filter(item => item.isValid).length,
+        invalid: displayList.apiKeys.filter(item => !item.isValid).length,
+        items: displayList.apiKeys
+      },
+      ssxmodTokens: {
+        total: displayList.ssxmod.length,
+        valid: displayList.ssxmod.filter(item => item.isValid).length,
+        invalid: displayList.ssxmod.filter(item => !item.isValid).length,
+        items: displayList.ssxmod
+      }
+    };
+
+    ctx.response.status = 200;
+    ctx.response.body = {
+      success: true,
+      message: 'Cookie 存储状态',
+      data: summary
+    };
+  } catch (error) {
+    console.error('获取 Cookie 列表失败:', error);
+    ctx.response.status = 500;
+    ctx.response.body = {
+      success: false,
+      message: '获取 Cookie 列表失败',
+      error: (error as Error).message
+    };
+  }
+});
+
+/**
+ * POST /cookies
+ * 批量导入 Cookie 字符串并解析其中的令牌
+ */
+router.post('/cookies', async (ctx: Context) => {
+  try {
+    const requestBody = await ctx.request.body({ type: 'json' }).value;
+
+    // 验证请求格式
+    if (!requestBody || !Array.isArray(requestBody.cookies)) {
+      ctx.response.status = 400;
+      ctx.response.body = {
+        success: false,
+        message:
+          '请求格式错误。请提供 { "cookies": ["cookie1", "cookie2", ...] } 格式'
+      };
+      return;
+    }
+
+    // 批量解析 Cookie
+    const result = await batchParseCookies(requestBody.cookies);
+    const displayList = await getDisplayList();
+
+    ctx.response.status = 200;
+    ctx.response.body = {
+      success: true,
+      message: 'Cookie 导入完成',
+      data: {
+        import: {
+          processed: result.totalProcessed,
+          tokensAdded: result.tokensAdded,
+          ssxmodsAdded: result.ssxmodsAdded
+        },
+        current: {
+          totalApiKeys: displayList.apiKeys.length,
+          totalSsxmods: displayList.ssxmod.length,
+          validApiKeys: displayList.apiKeys.filter(item => item.isValid).length,
+          validSsxmods: displayList.ssxmod.filter(item => item.isValid).length
+        }
+      }
+    };
+  } catch (error) {
+    console.error('导入 Cookie 失败:', error);
+    ctx.response.status = 500;
+    ctx.response.body = {
+      success: false,
+      message: '导入 Cookie 失败',
+      error: (error as Error).message
+    };
+  }
+});
+
+/**
+ * DELETE /cookies/invalid
+ * 删除所有标记为失效的令牌
+ */
+router.delete('/cookies/invalid', async (ctx: Context) => {
+  try {
+    // 使用KV存储的批量删除功能
+    const result = await kvStore.deleteInvalidTokens();
+    const deletedCount = result.deletedApiKeys + result.deletedSsxmods;
+
+    ctx.response.status = 200;
+    ctx.response.body = {
+      success: true,
+      message: `已删除 ${deletedCount} 个失效令牌`,
+      data: {
+        deletedCount,
+        deletedApiKeys: result.deletedApiKeys,
+        deletedSsxmods: result.deletedSsxmods,
+        remaining: await getDisplayList()
+      }
+    };
+  } catch (error) {
+    console.error('删除失效令牌失败:', error);
+    ctx.response.status = 500;
+    ctx.response.body = {
+      success: false,
+      message: '删除失效令牌失败',
+      error: (error as Error).message
+    };
+  }
+});
+
 // 应用中间件和路由
 app.use(authMiddleware); // 应用身份验证中间件
 app.use(router.routes()); // 应用路由
@@ -1025,8 +1952,12 @@ app.use(router.allowedMethods()); // 应用允许的 HTTP 方法
 
 // --- 4. 启动服务器 ---
 
+// 初始化KV存储
+console.log('初始化KV存储...');
+await kvStore.init();
+
 // 监听服务器启动事件，输出配置信息
-app.addEventListener('listen', ({ hostname, port }: any) => {
+app.addEventListener('listen', async ({ hostname, port }: any) => {
   console.log(`🚀 服务器正在监听 http://${hostname ?? 'localhost'}:${port}`);
   console.log('正在读取环境变量...');
   if (config.openaiApiKey) {
@@ -1034,15 +1965,18 @@ app.addEventListener('listen', ({ hostname, port }: any) => {
   } else {
     console.log('⚠️ OPENAI_API_KEY 未设置。身份验证已禁用。');
   }
+
+  // 显示内存存储状态（仅显示通过 /cookies 接口导入的密钥）
+  const displayList = await getDisplayList();
   console.log(
-    config.apiKeys.length > 0
-      ? '✅ API_KEY（用于上游）已设置。'
-      : '❌ API_KEY（用于上游）未设置。'
+    displayList.apiKeys.length > 0
+      ? `✅ Cookie API_KEY 存储：已导入 ${displayList.apiKeys.length} 个密钥`
+      : '❌ Cookie API_KEY 存储：暂无导入密钥'
   );
   console.log(
-    config.ssxmodItna
-      ? '✅ SSXMOD_ITNA（cookie）已设置。'
-      : '⚠️ SSXMOD_ITNA（cookie）未设置。'
+    displayList.ssxmod.length > 0
+      ? `✅ SSXMOD_ITNA 存储：已导入 ${displayList.ssxmod.length} 个令牌`
+      : '⚠️ SSXMOD_ITNA 存储：暂无导入令牌'
   );
 });
 
